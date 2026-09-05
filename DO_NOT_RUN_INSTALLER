@@ -1,0 +1,8 @@
+This tree replaces ovos-installer as the source of truth for clinton@mycroft-prime.lan.
+
+Do not run:
+  sudo sh -c "$(curl -fsSL https://raw.githubusercontent.com/OpenVoiceOS/ovos-installer/main/installer.sh)"
+  ~/ovos-installer/install.sh
+  ansible-playbook ... ovos-installer
+
+Those overwrite mycroft.conf, systemd units, /opt/sj201, and the venv.

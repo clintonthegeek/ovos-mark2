@@ -1,0 +1,7 @@
+# Optional git refs that replace a pin in constraints.txt.
+# Format: one PEP 508 line, e.g.
+# ovos-audio @ git+https://github.com/clintonthegeek/ovos-audio.git@<sha>
+#
+# Install with:
+#   ~/.venvs/ovos/bin/pip install --constraint pins/constraints.txt -r pins/overrides.txt
+# (empty on purpose until we fork a Python package)

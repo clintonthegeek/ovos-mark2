@@ -1,0 +1,4 @@
+# XVF3510-INT SPI boot image already on the device at
+# /opt/sj201/app_xvf3510_int_spi_boot_v4_2_0.bin (196608 bytes)
+# Upstream copy used by ovos-installer:
+https://raw.githubusercontent.com/OpenVoiceOS/ovos-buildroot/c67d7f0b7f2a3eff5faab96d6adf7495e9b48b93/buildroot-external/package/vocalfusion/app_xvf3510_int_spi_boot_v4_2_0.bin
