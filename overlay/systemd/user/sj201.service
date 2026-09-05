@@ -4,8 +4,10 @@ Description=SJ201 microphone + amp initialization
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/clinton/.venvs/sj201
-ExecStart=/home/clinton/.venvs/sj201/bin/python /opt/sj201/xvf3510-flash --direct /opt/sj201/app_xvf3510_int_spi_boot_v4_2_0.bin --verbose
+WorkingDirectory=/opt/sj201
+# setup_mclk needs /dev/mem (root). Passwordless sudo is installed on this box.
+ExecStartPre=-/usr/bin/sudo /opt/sj201/setup_mclk
+ExecStart=/usr/bin/python3 /opt/sj201/xvf3510-flash --verbose --verify /opt/sj201/app_xvf3510_int_spi_boot_v4_2_0.bin
 ExecStartPost=/home/clinton/.venvs/sj201/bin/python /opt/sj201/init_tas5806_fixed.py
 Restart=on-failure
 RestartSec=5s

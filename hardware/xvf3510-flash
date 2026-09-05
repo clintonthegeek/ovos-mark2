@@ -1,248 +1,263 @@
 #!/usr/bin/env python3
-# Copyright (c) 2019-2020, XMOS Ltd, All rights reserved
-# requires dtparam=spi=on in /boot/config.txt
+"""SJ-201 XVF3510-INT SPI slave boot.
 
-"""
-This script configures the XVF3510 board to boot from SPI slave and loads a
-binary file. It requires a bin file as an input parameter.
+Mark II has no I2C expander: --direct is the only path that makes sense.
+The upstream script uses Adafruit busio.SPI with no chip-select object.
+"Sending complete" therefore does not mean the DSP heard the image.
+
+This rewrite:
+  * drives GPIO8 (SPI0 CE0) as a GPIO chip-select (active low)
+  * holds RST_N low, BOOT_SEL high, waits, then releases reset
+  * bit-reverses each byte (XVF3510 SPI boot ROM is LSB-first)
+  * optionally verifies I2C 0x2C and a non-silent I2S capture
 """
 
+from __future__ import annotations
+
+import argparse
+import subprocess
 import sys
 import time
-import argparse
-from smbus2 import SMBus
-import digitalio
-import busio
 from pathlib import Path
-import board
-from typing import Optional
 
-# Global variables for GPIO pins
-BOOT_SEL_PIN = digitalio.DigitalInOut(board.D26)  # GPIO pin used for boot selection (PIN 37)
-RST_N_PIN = digitalio.DigitalInOut(board.D27)     # GPIO pin used for reset (PIN 13)
-I2C_ADDRESS = 0x2C                                # I2C address for the I/O expander. TODO: 0x20 was in original code, misstake?
+PWR_GPIO = 16
+BOOT_SEL_GPIO = 26
+RST_N_GPIO = 27
+CS_GPIO = 8  # SPI0_CE0_N on the 40-pin header
+XMOS_I2C = 0x2C
+TAS_I2C = 0x2F
+SPI_BLOCK = 4096
 
-if sys.version_info[0] < 3:
-    print("This script requires Python 3.")
-    sys.exit(1)
-
-def bit_reversed_byte(byte_to_reverse: int) -> int:
-    """
-    Reverse the bits of a byte.
-
-    Args:
-        byte_to_reverse (int): The byte to reverse.
-
-    Returns:
-        int: The reversed byte.
-    """
-    return int("{:08b}".format(byte_to_reverse)[::-1], 2)
+REVERSE = [int(f"{b:08b}"[::-1], 2) for b in range(256)]
 
 
-def set_boot_sel() -> None:
-    """
-    Set XVF3510 board in SPI slave boot mode using I2C to manipulate BOOT_SEL pin.
-    """
+def sh(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(args, check=check, text=True, capture_output=True)
+
+
+def pinctrl_set(spec: str) -> None:
+    sh("pinctrl", "set", *spec.split())
+
+
+def pinctrl_get(gpio: int) -> str:
+    return sh("pinctrl", "get", str(gpio)).stdout.strip()
+
+
+def i2c_present(addr: int) -> bool:
     try:
+        from smbus2 import SMBus
+
         with SMBus(1) as bus:
-            # Reset BOOT_SEL to default
-            bus.write_byte_data(I2C_ADDRESS, 3, 0xFE)
-            bus.write_byte_data(I2C_ADDRESS, 7, 0xFF)
+            bus.read_byte(addr)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        # some adapters NAK read_byte but ack a register read
+        try:
+            from smbus2 import SMBus
 
-            # Preserve other settings while manipulating BOOT_SEL
-            state = {i: bus.read_byte_data(I2C_ADDRESS, i) for i in [2, 6]}
-
-            # Start reset sequence
-            for i in [2, 6]:
-                bus.write_byte_data(I2C_ADDRESS, i, 0x00 | (state[i] & 0xDF))
-            # Set BOOT_SEL high
-            bus.write_byte_data(I2C_ADDRESS, 3, 0x01)
-            bus.write_byte_data(I2C_ADDRESS, 7, 0xFE)
-            # End reset sequence
-            for i in [2, 6]:
-                bus.write_byte_data(I2C_ADDRESS, i, 0x20 | (state[i] & 0xDF))
-    except Exception as e:
-        print(f"Error setting BOOT_SEL via I2C: {e}")
-        sys.exit(1)
+            with SMBus(1) as bus:
+                bus.read_byte_data(addr, 0)
+            return True
+        except Exception:
+            return False
 
 
-def send_image(
-    bin_filename: str,
-    verbose: bool = False,
-    max_spi_speed_mhz: float = 5,
-    block_transfer_pause_ms: float = 1,
-    direct: bool = False,
-    delay: bool = False,
-) -> None:
-    """
-    Send the given image to the device via SPI slave.
+def capture_nonzero(seconds: float = 1.0) -> tuple[bool, str]:
+    wav = Path("/tmp/xvf3510-verify.wav")
+    r = subprocess.run(
+        [
+            "arecord",
+            "-D",
+            "hw:1,1",
+            "-f",
+            "S32_LE",
+            "-c",
+            "2",
+            "-r",
+            "48000",
+            "-d",
+            str(int(seconds)),
+            str(wav),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0 or not wav.exists():
+        return False, f"arecord failed: {r.stderr.strip() or r.returncode}"
+    import array
+    import wave
 
-    Args:
-        bin_filename (str): Binary file name.
-        verbose (bool, optional): Enable verbose output. Defaults to False.
-        max_spi_speed_mhz (float, optional): Max SPI speed in MHz. Defaults to 5.
-        block_transfer_pause_ms (float, optional): Pause between blocks in milliseconds. Defaults to 1.
-        direct (bool, optional): Direct mode flag. Defaults to False.
-        delay (bool, optional): Delay startup flag. Defaults to False.
-    """
-    binary_size = Path(bin_filename).stat().st_size
-    print(f'Read file "{bin_filename}" size: {binary_size} Bytes')
+    with wave.open(str(wav), "rb") as w:
+        n, ch, sw = w.getnframes(), w.getnchannels(), w.getsampwidth()
+        raw = w.readframes(n)
+    if sw != 4:
+        return False, f"unexpected sampwidth {sw}"
+    samples = array.array("i")
+    samples.frombytes(raw)
+    uniq = len(set(samples))
+    nz = sum(1 for s in samples if s != 0)
+    msg = f"frames={n} ch={ch} unique={uniq} nonzero={nz}/{len(samples)}"
+    return nz > 0 and uniq > 4, msg
 
-    if direct:
-        BOOT_SEL_PIN.switch_to_input()
-        RST_N_PIN.switch_to_output()
-        RST_N_PIN.value=1
 
-    spi = setup_spi(max_spi_speed_mhz)
+class GpioOut:
+    def __init__(self, gpio: int, high: bool) -> None:
+        self.gpio = gpio
+        pinctrl_set(f"{gpio} op {'dh' if high else 'dl'}")
 
-    if direct:
-        RST_N_PIN.value=False
-        BOOT_SEL_PIN.switch_to_output()
-        BOOT_SEL_PIN.value=True
-        RST_N_PIN.value=True
-    else:
-        set_boot_sel()
+    def set(self, high: bool) -> None:
+        pinctrl_set(f"{self.gpio} op {'dh' if high else 'dl'}")
 
-    reverse_table = [bit_reversed_byte(byte) for byte in range(256)]
+    def input(self) -> None:
+        pinctrl_set(f"{self.gpio} ip")
 
+
+def open_spi(speed_hz: int, mode: int):
+    import spidev
+
+    spi = spidev.SpiDev()
+    spi.open(0, 0)
+    spi.max_speed_hz = speed_hz
+    spi.mode = mode
+    spi.bits_per_word = 8
     try:
-        with open(bin_filename, "rb") as f:
-            data = list(f.read())
+        spi.no_cs = True
     except Exception as e:
-        print(f"Error reading binary file: {e}")
-        sys.exit(1)
-
-    send_data_over_spi(data, spi, reverse_table, verbose, block_transfer_pause_ms, direct, delay)
-
-    print("Sending complete")
-
-    if direct:
-        # Once booted, the Pi should not need to drive boot_sel and reset
-        BOOT_SEL_PIN.switch_to_input()
-        RST_N_PIN.value=True
-    else:
-        # Reset BOOT_SEL to default state
-        with SMBus(1) as bus:
-            bus.write_byte_data(I2C_ADDRESS, 3, 0xFE)
-            bus.write_byte_data(I2C_ADDRESS, 7, 0xFF)
-
-
-def setup_spi(max_spi_speed_mhz: float) -> busio.SPI:
-    """
-    Set up the SPI bus.
-
-    Args:
-        max_spi_speed_mhz (float): Max SPI speed in MHz.
-
-    Returns:
-        busio.SPI: Configured SPI bus.
-    """
-    spi = busio.SPI(board.SCLK, MOSI=board.MOSI, MISO=board.MISO)
-    while not spi.try_lock():
-        pass
-    spi.configure(baudrate=max_spi_speed_mhz * 1_000_000)
+        print(f"warning: could not set SPI_NO_CS ({e}); kernel may still wiggle CE0")
     return spi
 
 
-def send_data_over_spi(
-    data: list,
-    spi: busio.SPI,
-    reverse_table: list,
+def xfer_block(spi, cs: GpioOut, block: bytes) -> None:
+    cs.set(False)  # active low
+    # spidev has a 4096-byte xfer limit on some kernels; write in 4096 anyway
+    mv = memoryview(block)
+    step = 4096
+    for off in range(0, len(block), step):
+        spi.writebytes(list(mv[off : off + step]))
+    cs.set(True)
+
+
+def send_image(
+    bin_path: Path,
+    speed_hz: int,
+    mode: int,
+    rst_hold_s: float,
+    rst_release_s: float,
+    pll_pause_s: float,
+    block_pause_s: float,
+    cs_held: bool,
     verbose: bool,
-    pause_ms: float,
-    direct: bool,
-    delay: bool,
 ) -> None:
-    """
-    Send data over SPI, handling block transfers and optional delays.
+    data = bin_path.read_bytes()
+    print(f'Read file "{bin_path}" size: {len(data)} Bytes')
+    print(f"SPI {speed_hz} Hz mode={mode} cs_held={cs_held}")
 
-    Args:
-        data (list): Data to send.
-        spi (busio.SPI): Configured SPI bus.
-        reverse_table (list): Table of bit-reversed byte values.
-        verbose (bool): Enable verbose output.
-        pause_ms (float): Pause between blocks in milliseconds.
-        direct (bool): Direct mode flag.
-        delay (bool): Delay startup flag.
-    """
-    spi_block_size = 4096
-    block_count = 0
-    total_data_length = len(data)
-    for i in range(0, total_data_length, spi_block_size):
-        block = [reverse_table[byte] for byte in data[i : i + spi_block_size]]
-        if verbose:
-            print(f"Sending {len(block)} Bytes in block {block_count} checksum 0x{sum(block):X}")
-        spi.write(block)
+    pwr = GpioOut(PWR_GPIO, True)
+    cs = GpioOut(CS_GPIO, True)
+    rst = GpioOut(RST_N_GPIO, True)
+    boot = GpioOut(BOOT_SEL_GPIO, False)
 
-        # Update the remaining data length after each block transfer
-        remaining_data_length = total_data_length - (i + len(block))
-        handle_block_transfer(
-            block_count, delay, direct, pause_ms, remaining_data_length
-        )
-        block_count += 1
+    spi = open_spi(speed_hz, mode)
+    try:
+        # Power already high. Hold in reset, select SPI slave boot.
+        rst.set(False)
+        boot.set(True)
+        cs.set(True)
+        time.sleep(rst_hold_s)
+        rst.set(True)
+        time.sleep(rst_release_s)
+        print(f"reset released; {pinctrl_get(BOOT_SEL_GPIO)}; {pinctrl_get(RST_N_GPIO)}; {pinctrl_get(CS_GPIO)}")
 
+        if cs_held:
+            cs.set(False)
 
-def handle_block_transfer(
-    block_count: int, delay: bool, direct: bool, pause_ms: float, remaining_data_length: int
-) -> None:
-    """
-    Handle specifics of block transfer, including initial delays and conditional logic for direct mode.
-
-    Args:
-        block_count (int): Number of blocks sent.
-        delay (bool): Delay startup flag.
-        direct (bool): Direct mode flag.
-        pause_ms (float): Pause between blocks in milliseconds.
-        remaining_data_length (int): Length of remaining data to send.
-    """
-    if block_count == 0:
-        # Long delay for PLL reboot
-        time.sleep(0.1)
-
-        if delay:
-            # release boot_sel early to prevent startup
-            if direct:
-                # release boot_sel early to prevent startup
-                BOOT_SEL_PIN.switch_to_input()
+        for i in range(0, len(data), SPI_BLOCK):
+            chunk = bytes(REVERSE[b] for b in data[i : i + SPI_BLOCK])
+            n = i // SPI_BLOCK
+            if verbose:
+                print(f"Sending {len(chunk)} Bytes in block {n} checksum 0x{sum(chunk):X}")
+            if cs_held:
+                spi.writebytes(list(chunk))
             else:
-                # Reset BOOT_SEL to default state
-                with SMBus(1) as bus:
-                    bus.write_byte_data(I2C_ADDRESS, 3, 0xFE)
-                    bus.write_byte_data(I2C_ADDRESS, 7, 0xFF)
+                xfer_block(spi, cs, chunk)
+            if n == 0:
+                if cs_held:
+                    cs.set(True)
+                time.sleep(pll_pause_s)
+                if cs_held:
+                    cs.set(False)
+            elif i + SPI_BLOCK < len(data):
+                time.sleep(block_pause_s)
 
-    elif remaining_data_length > 0:
-        time.sleep(pause_ms / 1000)
+        if cs_held:
+            cs.set(True)
+    finally:
+        spi.close()
+        cs.set(True)
+        boot.input()
+        rst.set(True)
+        pwr.set(True)
+
+    print("Sending complete")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Load an image via SPI slave from an RPi")
-    parser.add_argument("bin_filename", help="binary file name")
-    parser.add_argument("--direct", action="store_true", help="Use direct GPIO outputs rather than the XVF3510 Development Kit Pi HAT")
-    parser.add_argument("--delay", action="store_true", help="Delay xvf3510 device start")
-    parser.add_argument("--max-spi-speed-mhz", type=float, default=5, help="Max SPI speed in MHz")
-    parser.add_argument("--block-transfer-pause-ms", type=float, default=1, help="Pause between SPI transfers in milliseconds")
-    parser.add_argument("--verbose", action="store_true", help="Print debug information")
-    args = parser.parse_args()
+def main() -> int:
+    p = argparse.ArgumentParser(description="XVF3510-INT SPI slave boot (Mark II / SJ-201)")
+    p.add_argument("bin_filename")
+    p.add_argument("--direct", action="store_true", help="ignored; Mark II is always direct GPIO")
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--max-spi-speed-mhz", type=float, default=5.0)
+    p.add_argument("--spi-mode", type=int, default=0, choices=(0, 1, 2, 3))
+    p.add_argument("--block-transfer-pause-ms", type=float, default=1.0)
+    p.add_argument("--rst-hold-ms", type=float, default=100.0)
+    p.add_argument("--rst-release-ms", type=float, default=100.0)
+    p.add_argument("--pll-pause-ms", type=float, default=100.0)
+    p.add_argument("--cs-held", action="store_true", help="hold CS low for the whole image (except PLL pause)")
+    p.add_argument("--verify", action="store_true", help="check I2C 0x2C and capture after boot")
+    p.add_argument("--verify-wait-s", type=float, default=2.0)
+    args = p.parse_args()
 
     bin_path = Path(args.bin_filename)
     if not bin_path.is_file():
-        print(f"Error: input file {bin_path} not found")
-        sys.exit(1)
+        print(f"Error: input file {bin_path} not found", file=sys.stderr)
+        return 1
 
-    start_time = time.time()
+    t0 = time.time()
     send_image(
         bin_path,
-        args.verbose,
-        args.max_spi_speed_mhz,
-        args.block_transfer_pause_ms,
-        args.direct,
-        args.delay,
+        speed_hz=int(args.max_spi_speed_mhz * 1_000_000),
+        mode=args.spi_mode,
+        rst_hold_s=args.rst_hold_ms / 1000.0,
+        rst_release_s=args.rst_release_ms / 1000.0,
+        pll_pause_s=args.pll_pause_ms / 1000.0,
+        block_pause_s=args.block_transfer_pause_ms / 1000.0,
+        cs_held=args.cs_held,
+        verbose=args.verbose,
     )
-    end_time = time.time()
-
-    BOOT_SEL_PIN.deinit()
-    RST_N_PIN.deinit()
-
     if args.verbose:
-        print(f"Sending image took {end_time - start_time:.3f} seconds")
+        print(f"Sending image took {time.time() - t0:.3f} seconds")
 
+    if not args.verify:
+        return 0
+
+    time.sleep(args.verify_wait_s)
+    # I2S clocks must be running or the XVF3510 ignores I2C.
+    ok, cap = capture_nonzero(1.0)
+    print(f"capture: {cap}")
+    xmos = i2c_present(XMOS_I2C)
+    tas = i2c_present(TAS_I2C)
+    print(f"I2C TAS5806 0x{TAS_I2C:02x}: {'yes' if tas else 'no'}")
+    print(f"I2C XVF3510 0x{XMOS_I2C:02x}: {'yes' if xmos else 'no'}")
+    if xmos:
+        print("VERIFY ok (XMOS I2C 0x2C present)")
+        if not ok:
+            print("note: raw hw:1,1 capture skipped or silent (often busy under PipeWire)")
+        return 0
+    print("VERIFY failed (no I2C 0x2C — DSP did not boot)", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
