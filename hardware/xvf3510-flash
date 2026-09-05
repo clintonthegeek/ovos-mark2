@@ -196,7 +196,8 @@ def send_image(
     finally:
         spi.close()
         cs.set(True)
-        boot.input()
+        # release BOOT_SEL with no pull so the chip can hold it
+        sh("pinctrl", "set", "26", "ip", "pn")
         rst.set(True)
         pwr.set(True)
 

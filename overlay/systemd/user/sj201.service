@@ -7,10 +7,13 @@ Type=oneshot
 WorkingDirectory=/opt/sj201
 # setup_mclk needs /dev/mem (root). Passwordless sudo is installed on this box.
 ExecStartPre=-/usr/bin/sudo /opt/sj201/setup_mclk
-ExecStart=/usr/bin/python3 /opt/sj201/xvf3510-flash --verbose --verify /opt/sj201/app_xvf3510_int_spi_boot_v4_2_0.bin
+# Do not pass --verify here. Verify opens hw:1,1; ovos-listener/PipeWire
+# already hold it at boot, so verify exits 2 and Restart=on-failure
+# re-resets the RAM-loaded XMOS forever.
+ExecStart=/usr/bin/python3 /opt/sj201/xvf3510-flash --verbose /opt/sj201/app_xvf3510_int_spi_boot_v4_2_0.bin
 ExecStartPost=/home/clinton/.venvs/sj201/bin/python /opt/sj201/init_tas5806_fixed.py
-Restart=on-failure
-RestartSec=5s
+# oneshot: fail the unit if python crashes, but do not loop-reflash
+Restart=no
 RemainAfterExit=yes
 
 [Install]
