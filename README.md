@@ -15,6 +15,8 @@ The live box (`clinton@mycroft-prime.lan`) was installed with `ovos-installer` `
 
 We do **not** re-run `ovos-installer`. We do **not** `pip install -U ovos-*`. Fixes land here (or in a tiny fork of a single package) and get rsynced to the Pi.
 
+**Social contract** (read this): [`../docs/CONTRIBUTING-UPSTREAM.md`](../docs/CONTRIBUTING-UPSTREAM.md). They keep `main`. We keep this snapshot. We are a user with a pin, not a rival distro. Agents must coach Clinton before any public GitHub contact.
+
 ## Snapshot (2026-09-05)
 
 - Pi 4B 2 GB + SJ-201, Trixie Lite 64-bit
