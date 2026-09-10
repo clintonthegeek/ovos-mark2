@@ -17,6 +17,8 @@ We do **not** re-run `ovos-installer`. We do **not** `pip install -U ovos-*`. Fi
 
 **Social contract** (read this): [`../docs/CONTRIBUTING-UPSTREAM.md`](../docs/CONTRIBUTING-UPSTREAM.md). They keep `main`. We keep this snapshot. We are a user with a pin, not a rival distro. Agents must coach Clinton before any public GitHub contact.
 
+**Current work:** [`../HANDOFF.md`](../HANDOFF.md) — do not reinstall; next bug is 48 kHz I2S vs 16 kHz listener.
+
 ## Snapshot (2026-09-05)
 
 - Pi 4B 2 GB + SJ-201, Trixie Lite 64-bit
